@@ -70,6 +70,22 @@ public class SchemaBuilder {
     private static final String[] RESERVED_ATTRIBUTES_LIST = {
         "name", "type", "default", "fixed", "form", "id", "use", "ref"
     };
+    /**
+     * Maximum nesting depth of the structural descent. The DOM-to-model walk
+     * recurses once per nesting level of the schema document, so a bound is
+     * required to keep a deeply nested document from overflowing the thread
+     * stack (neither FEATURE_SECURE_PROCESSING nor JDK defaults impose an
+     * element-depth limit on the XML parse itself). The counter lives on the
+     * XmlSchemaCollection, not on this builder: XmlSchemaCollection.read
+     * creates a fresh SchemaBuilder for every include/import/redefine
+     * document that resolveXmlSchema pulls in, but all those documents are
+     * built on one thread stack, so the depth must be carried across the
+     * hops rather than reset per document. Each nested document resolution
+     * counts one level toward the same bound (see resolveXmlSchema), which
+     * also bounds a chain of distinct single-hop documents.
+     */
+    static final int MAX_NESTING_DEPTH =
+        getIntProperty("org.apache.ws.commons.schema.maxNestingDepth", 512);
     XmlSchemaCollection collection;
     Document currentDocument;
     XmlSchema currentSchema;
@@ -115,6 +131,82 @@ public class SchemaBuilder {
             threadResolvedSchemas.clear();
             resolvedSchemas.remove();
         }
+    }
+
+    private void enterNestedStructure() {
+        // Check before incrementing: on a breach the counter is left
+        // untouched, so the shared per-collection count stays balanced (every
+        // completed increment has a matching finally-decrement) even when the
+        // exception is caught and the collection is reused.
+        if (collection.builderNestingDepth >= MAX_NESTING_DEPTH) {
+            throw new XmlSchemaException("The schema is nested more than " + MAX_NESTING_DEPTH
+                                         + " levels deep (nested include/import/redefine document"
+                                         + " resolutions count toward the same depth bound); refusing to"
+                                         + " build it. The limit may be changed with the"
+                                         + " org.apache.ws.commons.schema.maxNestingDepth"
+                                         + " system property.");
+        }
+        collection.builderNestingDepth++;
+    }
+
+    private void exitNestedStructure() {
+        collection.builderNestingDepth--;
+    }
+
+    /**
+     * Refuse appinfo or documentation markup nested deeper than the structural
+     * bound allows. The markup is not schema structure, so the handlers never
+     * count it, but it is copied with a recursive cloneNode on this same thread
+     * stack, so it counts toward the same bound. Measured iteratively, as the
+     * point is to avoid recursing over it.
+     */
+    private void checkMarkupDepth(Element content) {
+        int depth = 0;
+        int maxDepth = 0;
+        Node node = content.getFirstChild();
+        if (node != null) {
+            depth = 1;
+        }
+        while (node != null) {
+            if (depth > maxDepth) {
+                maxDepth = depth;
+                if (collection.builderNestingDepth + maxDepth > MAX_NESTING_DEPTH) {
+                    throw new XmlSchemaException("The markup of an annotation is nested more than "
+                                                 + MAX_NESTING_DEPTH + " levels deep, counting the"
+                                                 + " schema structure around it; refusing to build it."
+                                                 + " The limit may be changed with the"
+                                                 + " org.apache.ws.commons.schema.maxNestingDepth"
+                                                 + " system property.");
+                }
+            }
+            if (node.getFirstChild() != null) {
+                node = node.getFirstChild();
+                depth++;
+                continue;
+            }
+            while (node != null && node.getNextSibling() == null) {
+                node = node.getParentNode();
+                depth--;
+                if (node == content) {
+                    node = null;
+                }
+            }
+            if (node != null) {
+                node = node.getNextSibling();
+            }
+        }
+    }
+
+    private static int getIntProperty(String name, int defaultValue) {
+        try {
+            Integer value = Integer.getInteger(name);
+            if (value != null) {
+                return value.intValue();
+            }
+        } catch (RuntimeException e) {
+            // fall through to the default
+        }
+        return defaultValue;
     }
 
     /**
@@ -256,6 +348,7 @@ public class SchemaBuilder {
      */
     XmlSchemaAppInfo handleAppInfo(Element content) {
         XmlSchemaAppInfo appInfo = new XmlSchemaAppInfo();
+        checkMarkupDepth(content);
         NodeList markup = new DocumentFragmentNodeList(content);
 
         if (!content.hasAttribute("source") && markup.getLength() == 0) {
@@ -277,6 +370,16 @@ public class SchemaBuilder {
      */
     XmlSchemaComplexType handleComplexType(XmlSchema schema, Element complexEl, Element schemaEl,
                                            boolean topLevel) {
+        enterNestedStructure();
+        try {
+            return doHandleComplexType(schema, complexEl, schemaEl, topLevel);
+        } finally {
+            exitNestedStructure();
+        }
+    }
+
+    private XmlSchemaComplexType doHandleComplexType(XmlSchema schema, Element complexEl, Element schemaEl,
+                                                     boolean topLevel) {
 
         XmlSchemaComplexType ct = new XmlSchemaComplexType(schema, topLevel);
 
@@ -358,6 +461,7 @@ public class SchemaBuilder {
     // to collection
     XmlSchemaDocumentation handleDocumentation(Element content) {
         XmlSchemaDocumentation documentation = new XmlSchemaDocumentation();
+        checkMarkupDepth(content);
         List<Node> markup = getChildren(content);
 
         if (!content.hasAttribute("source") && !content.hasAttribute("xml:lang") && markup == null) {
@@ -383,6 +487,16 @@ public class SchemaBuilder {
      * @param isGlobal
      */
     XmlSchemaElement handleElement(XmlSchema schema, Element el, Element schemaEl, boolean isGlobal) {
+        enterNestedStructure();
+        try {
+            return doHandleElement(schema, el, schemaEl, isGlobal);
+        } finally {
+            exitNestedStructure();
+        }
+    }
+
+    private XmlSchemaElement doHandleElement(XmlSchema schema, Element el, Element schemaEl,
+                                             boolean isGlobal) {
 
         XmlSchemaElement element = new XmlSchemaElement(schema, isGlobal);
 
@@ -589,6 +703,16 @@ public class SchemaBuilder {
      */
     XmlSchemaSimpleType handleSimpleType(XmlSchema schema, Element simpleEl, Element schemaEl,
                                          boolean topLevel) {
+        enterNestedStructure();
+        try {
+            return doHandleSimpleType(schema, simpleEl, schemaEl, topLevel);
+        } finally {
+            exitNestedStructure();
+        }
+    }
+
+    private XmlSchemaSimpleType doHandleSimpleType(XmlSchema schema, Element simpleEl, Element schemaEl,
+                                                   boolean topLevel) {
         XmlSchemaSimpleType simpleType = new XmlSchemaSimpleType(schema, topLevel);
         if (simpleEl.hasAttribute("name")) {
             simpleType.setName(simpleEl.getAttribute("name"));
@@ -700,9 +824,20 @@ public class SchemaBuilder {
             if (collection.check(key)) {
                 collection.push(key);
                 try {
-                    XmlSchema readSchema = collection.read(source, validator);
-                    putCachedSchema(targetNamespace, schemaLocation, baseUri, readSchema);
-                    return readSchema;
+                    // The nested document is built by a fresh SchemaBuilder
+                    // (collection.read creates one per document) but on this
+                    // same thread stack, so the hop counts one level toward
+                    // the shared per-collection nesting bound. Exact-key
+                    // cycle detection (check/push) alone does not bound a
+                    // chain of distinct schema locations.
+                    enterNestedStructure();
+                    try {
+                        XmlSchema readSchema = collection.read(source, validator);
+                        putCachedSchema(targetNamespace, schemaLocation, baseUri, readSchema);
+                        return readSchema;
+                    } finally {
+                        exitNestedStructure();
+                    }
                 } finally {
                     collection.pop();
                 }
@@ -836,6 +971,15 @@ public class SchemaBuilder {
     }
 
     private XmlSchemaAll handleAll(XmlSchema schema, Element allEl, Element schemaEl) {
+        enterNestedStructure();
+        try {
+            return doHandleAll(schema, allEl, schemaEl);
+        } finally {
+            exitNestedStructure();
+        }
+    }
+
+    private XmlSchemaAll doHandleAll(XmlSchema schema, Element allEl, Element schemaEl) {
 
         XmlSchemaAll all = new XmlSchemaAll();
 
@@ -1082,6 +1226,15 @@ public class SchemaBuilder {
     }
 
     private XmlSchemaChoice handleChoice(XmlSchema schema, Element choiceEl, Element schemaEl) {
+        enterNestedStructure();
+        try {
+            return doHandleChoice(schema, choiceEl, schemaEl);
+        } finally {
+            exitNestedStructure();
+        }
+    }
+
+    private XmlSchemaChoice doHandleChoice(XmlSchema schema, Element choiceEl, Element schemaEl) {
         XmlSchemaChoice choice = new XmlSchemaChoice();
 
         if (choiceEl.hasAttribute("id")) {
@@ -1539,6 +1692,15 @@ public class SchemaBuilder {
     }
 
     private XmlSchemaSequence handleSequence(XmlSchema schema, Element sequenceEl, Element schemaEl) {
+        enterNestedStructure();
+        try {
+            return doHandleSequence(schema, sequenceEl, schemaEl);
+        } finally {
+            exitNestedStructure();
+        }
+    }
+
+    private XmlSchemaSequence doHandleSequence(XmlSchema schema, Element sequenceEl, Element schemaEl) {
 
         XmlSchemaSequence sequence = new XmlSchemaSequence();
 

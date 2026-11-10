@@ -205,6 +205,20 @@ public final class XmlSchemaCollection {
         return !stack.contains(pKey);
     }
 
+    /**
+     * Structural nesting depth of the schema build currently in progress on
+     * this collection. Maintained by SchemaBuilder (balanced increments and
+     * finally-decrements, so it always returns to zero when the outermost
+     * read completes or throws). It lives here rather than on SchemaBuilder
+     * because read() creates a fresh SchemaBuilder for every
+     * include/import/redefine document that SchemaBuilder.resolveXmlSchema
+     * pulls in, while all those documents are built on a single thread
+     * stack: the bound has to be carried across the nested reads, not reset
+     * per document. Package-private and accessed directly by SchemaBuilder,
+     * like {@link #baseUri}.
+     */
+    int builderNestingDepth;
+
     public ExtensionRegistry getExtReg() {
         return extReg;
     }
@@ -788,6 +802,8 @@ public final class XmlSchemaCollection {
             DocumentBuilderFactory docFac = DocumentBuilderFactory.newInstance();
             docFac.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, Boolean.TRUE);
             docFac.setNamespaceAware(true);
+            limitElementDepth(docFac);
+            limitEntityExpansion(docFac);
             final DocumentBuilder builder = docFac.newDocumentBuilder();
             Document doc = null;
             doc = parseDoPriv(inputSource, builder, doc);
@@ -797,6 +813,21 @@ public final class XmlSchemaCollection {
         } catch (IOException e) {
             throw new XmlSchemaException(e.getMessage(), e);
         } catch (SAXException e) {
+            if (e.getMessage() != null && e.getMessage().startsWith(ELEMENT_DEPTH_ERROR + ":")) {
+                // Name the property that governs the limit: raising jdk.xml.maxElementDepth alone
+                // has no effect, as limitElementDepth() lowers it again.
+                throw new XmlSchemaException("The schema document is nested too deeply to parse ("
+                                             + e.getMessage() + "). The limit is twice the"
+                                             + " org.apache.ws.commons.schema.maxNestingDepth system"
+                                             + " property plus 64, unless jdk.xml.maxElementDepth"
+                                             + " sets a lower one.", e);
+            }
+            if (e.getMessage() != null && e.getMessage().startsWith(ENTITY_EXPANSION_ERROR + ":")) {
+                throw new XmlSchemaException("The schema document expands too many entities to parse ("
+                                             + e.getMessage() + "). The limit is "
+                                             + MAX_ENTITY_EXPANSIONS + ", unless"
+                                             + " jdk.xml.entityExpansionLimit sets a lower one.", e);
+            }
             throw new XmlSchemaException(e.getMessage(), e);
         }
     }
@@ -836,6 +867,110 @@ public final class XmlSchemaCollection {
             }
         }
         return doc;
+    }
+
+    /**
+     * The JDK parser's element-depth limit, <code>jdk.xml.maxElementDepth</code>, under the name
+     * JDK 8 onwards accepts on a factory.
+     */
+    private static final String MAX_ELEMENT_DEPTH =
+        "http://www.oracle.com/xml/jaxp/properties/maxElementDepth";
+
+    /** The code that starts the JDK parser's message when that limit is exceeded. */
+    private static final String ELEMENT_DEPTH_ERROR = "JAXP00010006";
+
+    /**
+     * Bound the element depth of the parse itself. An internal DTD subset is accepted, and the JDK
+     * builds an entity's replacement markup recursively: a 35 KB schema whose entity expands to
+     * elements nested a few thousand deep overflowed the thread stack inside the parser, before
+     * the schema builder's own nesting bound could see it. The builder never accepts a document
+     * deeper than about twice its structural bound, maxNestingDepth, since each counted level (an
+     * element, a type, a model group) is at most two XML levels deep, so refusing deeper markup
+     * in the parser costs nothing. A lower limit already set, by jdk.xml.maxElementDepth or by the
+     * JDK's own default, is left in place where it can be seen: see currentLimit.
+     */
+    private static void limitElementDepth(DocumentBuilderFactory docFac) {
+        keepLowerLimit(docFac, MAX_ELEMENT_DEPTH, "jdk.xml.maxElementDepth",
+                       elementDepthLimit(SchemaBuilder.MAX_NESTING_DEPTH));
+    }
+
+    /**
+     * The JDK parser's entity-expansion limit, <code>jdk.xml.entityExpansionLimit</code>, under
+     * the name JDK 8 onwards accepts on a factory.
+     */
+    private static final String ENTITY_EXPANSION_LIMIT =
+        "http://www.oracle.com/xml/jaxp/properties/entityExpansionLimit";
+
+    /** The code that starts the JDK parser's message when that limit is exceeded. */
+    private static final String ENTITY_EXPANSION_ERROR = "JAXP00010001";
+
+    /** The most entity expansions one schema document may make. */
+    static final long MAX_ENTITY_EXPANSIONS = 1000;
+
+    /**
+     * Bound the number of entity expansions in the parse. The JDK unwinds nested entities
+     * recursively, one level of its own stack per level of nesting, so a chain of internal
+     * entities each referring to the next overflowed the thread stack on JDK 8 to 21: the
+     * default limit of 64,000 expansions (2,500 on JDK 25) allows a chain far deeper than a
+     * thread stack holds. A chain that also adds text at each level ran out of memory instead.
+     * Schema documents that use an internal DTD subset declare a few entities for namespace
+     * names and make a handful of references to them, so 1,000 costs nothing. A lower limit
+     * already set, by jdk.xml.entityExpansionLimit, is left in place where it can be seen.
+     */
+    private static void limitEntityExpansion(DocumentBuilderFactory docFac) {
+        keepLowerLimit(docFac, ENTITY_EXPANSION_LIMIT, "jdk.xml.entityExpansionLimit",
+                       MAX_ENTITY_EXPANSIONS);
+    }
+
+    /**
+     * Set a JDK parser limit on the factory, unless a lower one is already in force.
+     */
+    private static void keepLowerLimit(DocumentBuilderFactory docFac, String attribute,
+                                       String property, long limit) {
+        final long existing = currentLimit(docFac, attribute, property);
+        if (existing > 0 && existing <= limit) {
+            return;
+        }
+        try {
+            docFac.setAttribute(attribute, String.valueOf(limit));
+        } catch (IllegalArgumentException e) {
+            // A parser other than the JDK's, which does not recognize the property.
+        }
+    }
+
+    /**
+     * The parser element-depth limit for a given maxNestingDepth: twice it plus 64, kept between
+     * 1 and Integer.MAX_VALUE so that no setting of maxNestingDepth, however extreme, turns the
+     * limit off (the JDK reads 0 or less as no limit).
+     */
+    static long elementDepthLimit(int maxNestingDepth) {
+        return Math.max(1L, Math.min(Integer.MAX_VALUE, 2L * maxNestingDepth + 64L));
+    }
+
+    /**
+     * The limit already in force for a JDK parser property, or 0 for none. Only some JDKs report
+     * it through the factory: JDK 21 does; JDK 8 and 11 throw IllegalArgumentException, and JDK 17
+     * reports only attributes set on the factory itself, returning null or throwing
+     * NullPointerException. When the factory gives no value, the system property the parser takes
+     * it from is read instead. On those JDKs a limit set only in the JDK's jaxp.properties file is
+     * not seen, and is raised to this library's own.
+     */
+    private static long currentLimit(DocumentBuilderFactory docFac, String attribute,
+                                     String property) {
+        Object current = null;
+        try {
+            current = docFac.getAttribute(attribute);
+        } catch (RuntimeException e) {
+            // Not reported by this JDK's factory.
+        }
+        if (current != null) {
+            try {
+                return Long.parseLong(current.toString().trim());
+            } catch (NumberFormatException e) {
+                // Fall back to the system property.
+            }
+        }
+        return getIntProperty(property, 0);
     }
     
     /**

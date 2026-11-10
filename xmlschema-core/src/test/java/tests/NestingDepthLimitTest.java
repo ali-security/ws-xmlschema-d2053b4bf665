@@ -1,0 +1,361 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements. See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership. The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License. You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied. See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package tests;
+
+import java.io.File;
+import java.io.FileWriter;
+import java.io.StringReader;
+import java.io.Writer;
+
+import javax.xml.namespace.QName;
+import javax.xml.parsers.DocumentBuilderFactory;
+
+import org.apache.ws.commons.schema.XmlSchema;
+import org.apache.ws.commons.schema.XmlSchemaCollection;
+import org.apache.ws.commons.schema.XmlSchemaException;
+
+import org.junit.After;
+import org.junit.Assert;
+import org.junit.Before;
+import org.junit.Test;
+
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+import org.xml.sax.InputSource;
+
+/**
+ * The structural descent of the schema build must be bounded: a deeply
+ * nested schema document must fail with the documented XmlSchemaException
+ * instead of exhausting the thread stack. The bound is shared across the
+ * documents of one read: every nested include/import/redefine resolution is
+ * built by a fresh SchemaBuilder but on the same thread stack, so the depth
+ * carries across resolveXmlSchema hops instead of resetting per document,
+ * and a chain of distinct single-hop documents is bounded too.
+ */
+public class NestingDepthLimitTest extends Assert {
+    private static final String MAX_ELEMENT_DEPTH = "jdk.xml.maxElementDepth";
+
+    private String savedMaxElementDepth;
+
+    /**
+     * Secure processing makes the JDK parser enforce its own element-depth
+     * limit (100 by default as of JDK 25), which would reject these
+     * documents before the schema build ever descends. Lift it so the bound
+     * under test is the library's own.
+     */
+    @Before
+    public void liftParserElementDepthLimit() {
+        savedMaxElementDepth = System.getProperty(MAX_ELEMENT_DEPTH);
+        System.setProperty(MAX_ELEMENT_DEPTH, "0");
+    }
+
+    @After
+    public void restoreParserElementDepthLimit() {
+        if (savedMaxElementDepth == null) {
+            System.clearProperty(MAX_ELEMENT_DEPTH);
+        } else {
+            System.setProperty(MAX_ELEMENT_DEPTH, savedMaxElementDepth);
+        }
+    }
+
+    @Test
+    public void testReasonablyNestedSchemaStillParses() throws Exception {
+        XmlSchemaCollection collection = new XmlSchemaCollection();
+        XmlSchema schema = collection.read(new StringReader(buildNestedSchema(50)));
+        assertNotNull(schema);
+    }
+
+    @Test
+    public void testDeeplyNestedSchemaIsRejected() throws Exception {
+        XmlSchemaCollection collection = new XmlSchemaCollection();
+        try {
+            collection.read(new StringReader(buildNestedSchema(600)));
+            fail("A schema document nested 600 particle levels deep should be rejected.");
+        } catch (XmlSchemaException expected) {
+            assertTrue(expected.getMessage().contains("nested"));
+        }
+    }
+
+    /**
+     * The counter must not reset across include hops: a chain of distinct
+     * documents, each individually trivial, must still hit the shared bound
+     * instead of adding stack frames per hop until the thread stack
+     * overflows. (Exact-key cycle detection never fires here because every
+     * schemaLocation is distinct.)
+     */
+    @Test
+    public void testIncludeChainOfDistinctDocumentsIsRejected() throws Exception {
+        File root = createIncludeChain(newTempDir(), 600, 0);
+        XmlSchemaCollection collection = new XmlSchemaCollection();
+        try {
+            collection.read(new InputSource(root.toURI().toString()));
+            fail("An include chain of 600 distinct documents should be rejected, not recursed.");
+        } catch (XmlSchemaException expected) {
+            assertTrue(expected.getMessage().contains("depth"));
+        }
+    }
+
+    @Test
+    public void testShallowIncludeChainWithNestedLeafStillParses() throws Exception {
+        File root = createIncludeChain(newTempDir(), 3, 50);
+        XmlSchemaCollection collection = new XmlSchemaCollection();
+        XmlSchema schema = collection.read(new InputSource(root.toURI().toString()));
+        assertNotNull(schema);
+    }
+
+    @Test
+    public void testCollectionIsReusableAfterRejection() throws Exception {
+        XmlSchemaCollection collection = new XmlSchemaCollection();
+        try {
+            collection.read(new StringReader(buildNestedSchema(600)));
+            fail("A schema document nested 600 particle levels deep should be rejected.");
+        } catch (XmlSchemaException expected) {
+            // expected; the counter must have unwound to zero.
+        }
+
+        XmlSchema schema = collection.read(new StringReader(buildNestedSchema(50, "urn:after-rejection")));
+        assertNotNull(schema);
+    }
+
+    /**
+     * Annotation markup is copied with a recursive cloneNode, so deep markup
+     * inside xs:documentation or xs:appinfo must hit the same bound rather
+     * than overflow the stack.
+     */
+    @Test
+    public void testDeeplyNestedDocumentationMarkupIsRejected() throws Exception {
+        assertMarkupRejected("documentation");
+    }
+
+    @Test
+    public void testDeeplyNestedAppInfoMarkupIsRejected() throws Exception {
+        assertMarkupRejected("appinfo");
+    }
+
+    @Test
+    public void testReasonablyNestedMarkupStillParses() throws Exception {
+        XmlSchemaCollection collection = new XmlSchemaCollection();
+        XmlSchema schema = collection.read(new StringReader(buildAnnotatedSchema("documentation", 50)));
+        assertNotNull(schema);
+        schema = collection.read(new StringReader(buildAnnotatedSchema("appinfo", 50)));
+        assertNotNull(schema);
+    }
+
+    /**
+     * read(Element) collects the namespace declarations of every ancestor of the
+     * schema element, which must not take a stack frame per ancestor when the
+     * schema is embedded deep in a larger document such as a WSDL. The prefix
+     * declared on the outermost wrapper must still be seen.
+     */
+    @Test
+    public void testSchemaEmbeddedDeepInADocumentStillParses() throws Exception {
+        int depth = 20000;
+        StringBuilder doc = new StringBuilder();
+        doc.append("<w xmlns:tns=\"urn:embedded\">");
+        for (int i = 1; i < depth; i++) {
+            doc.append("<w>");
+        }
+        doc.append("<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\"")
+            .append(" targetNamespace=\"urn:embedded\">")
+            .append("<xs:complexType name=\"t\"/>")
+            .append("<xs:element name=\"e\" type=\"tns:t\"/>")
+            .append("</xs:schema>");
+        for (int i = 0; i < depth; i++) {
+            doc.append("</w>");
+        }
+
+        DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+        factory.setNamespaceAware(true);
+        Document document = factory.newDocumentBuilder()
+            .parse(new InputSource(new StringReader(doc.toString())));
+        Element schemaElement = (Element)document
+            .getElementsByTagNameNS("http://www.w3.org/2001/XMLSchema", "schema").item(0);
+
+        XmlSchema schema = new XmlSchemaCollection().read(schemaElement);
+        assertEquals(new QName("urn:embedded", "t"),
+                     schema.getElementByName("e").getSchemaTypeName());
+    }
+
+    private void assertMarkupRejected(String kind) {
+        XmlSchemaCollection collection = new XmlSchemaCollection();
+        try {
+            collection.read(new StringReader(buildAnnotatedSchema(kind, 5000)));
+            fail("xs:" + kind + " markup nested 5000 levels deep should be rejected.");
+        } catch (XmlSchemaException expected) {
+            assertTrue(expected.getMessage().contains("nested"));
+        }
+    }
+
+    private String buildAnnotatedSchema(String kind, int depth) {
+        StringBuilder schema = new StringBuilder();
+        schema.append("<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\"")
+            .append(" targetNamespace=\"urn:markup-").append(kind).append("\">");
+        schema.append("<xs:annotation><xs:").append(kind).append(">");
+        for (int i = 0; i < depth; i++) {
+            schema.append("<a>");
+        }
+        schema.append("text");
+        for (int i = 0; i < depth; i++) {
+            schema.append("</a>");
+        }
+        schema.append("</xs:").append(kind).append("></xs:annotation></xs:schema>");
+        return schema.toString();
+    }
+
+    /**
+     * An internal DTD subset is accepted, and the JDK parser builds an entity's replacement markup
+     * recursively, so a small document whose entity expands to deeply nested elements used to
+     * overflow the stack inside the parser, before the schema builder saw any of it.
+     */
+    @Test
+    public void testEntityExpandingToDeepMarkupIsRejected() throws Exception {
+        assertRejectedAsNested("<!DOCTYPE xs:schema [<!ENTITY deep \"" + repeat("<m>", 5000)
+                               + repeat("</m>", 5000) + "\">]>"
+                               + "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">&deep;</xs:schema>");
+    }
+
+    @Test
+    public void testNestedEntitiesExpandingToDeepMarkupAreRejected() throws Exception {
+        StringBuilder dtd = new StringBuilder("<!DOCTYPE xs:schema [<!ENTITY e0 \"<m/>\">");
+        for (int i = 1; i < 100; i++) {
+            dtd.append("<!ENTITY e").append(i).append(" \"").append(repeat("<m>", 50)).append("&e")
+                .append(i - 1).append(';').append(repeat("</m>", 50)).append("\">");
+        }
+        dtd.append("]>");
+        assertRejectedAsNested(dtd + "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">&e99;"
+                               + "</xs:schema>");
+    }
+
+    /**
+     * Each counted level of structure is at most two XML levels deep, so the deepest schema the
+     * builder accepts is still parsed: here 510 nested anonymous simple types, 1025 elements deep.
+     */
+    @Test
+    public void testDeepestAcceptedSchemaStillParses() throws Exception {
+        StringBuilder schema = new StringBuilder("<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\""
+                                                 + " targetNamespace=\"urn:deepest\">"
+                                                 + "<xs:simpleType name=\"T\"><xs:restriction>");
+        schema.append(repeat("<xs:simpleType><xs:restriction>", 510))
+            .append("<xs:simpleType><xs:restriction base=\"xs:string\"/></xs:simpleType>")
+            .append(repeat("</xs:restriction></xs:simpleType>", 510))
+            .append("</xs:restriction></xs:simpleType></xs:schema>");
+        assertNotNull(new XmlSchemaCollection().read(new StringReader(schema.toString())));
+    }
+
+    /**
+     * A lower element-depth limit already in force is kept rather than raised.
+     */
+    @Test
+    public void testLowerParserDepthLimitIsKept() throws Exception {
+        System.setProperty(MAX_ELEMENT_DEPTH, "20");
+        try {
+            new XmlSchemaCollection().read(new StringReader(buildNestedSchema(10)));
+            fail("A schema 30 elements deep should be refused under a parser limit of 20.");
+        } catch (XmlSchemaException expected) {
+            assertTrue(expected.getMessage(), expected.getMessage().contains("nested"));
+        }
+    }
+
+    /**
+     * Only the parser's own depth error is reworded: a malformed document whose element is named
+     * after the error code keeps the parser's message.
+     */
+    @Test
+    public void testUnrelatedErrorNamingTheDepthCodeIsNotReworded() throws Exception {
+        try {
+            new XmlSchemaCollection().read(new StringReader(
+                "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\"><JAXP00010006></xs:schema>"));
+            fail("A malformed schema should be refused.");
+        } catch (XmlSchemaException expected) {
+            assertFalse(expected.getMessage(), expected.getMessage().contains("nested too deeply"));
+        }
+    }
+
+    private static void assertRejectedAsNested(String schema) {
+        try {
+            new XmlSchemaCollection().read(new StringReader(schema));
+            fail("The deeply nested schema should be rejected.");
+        } catch (XmlSchemaException expected) {
+            assertTrue(expected.getMessage(), expected.getMessage().contains("nested"));
+        }
+    }
+
+    private static String repeat(String s, int count) {
+        StringBuilder b = new StringBuilder(s.length() * count);
+        for (int i = 0; i < count; i++) {
+            b.append(s);
+        }
+        return b.toString();
+    }
+
+    private String buildNestedSchema(int depth) {
+        return buildNestedSchema(depth, "urn:nesting");
+    }
+
+    private String buildNestedSchema(int depth, String namespace) {
+        StringBuilder schema = new StringBuilder();
+        schema.append("<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\"")
+            .append(" targetNamespace=\"").append(namespace).append("\">");
+        schema.append("<xs:element name=\"root\">");
+        for (int i = 0; i < depth; i++) {
+            schema.append("<xs:complexType><xs:sequence><xs:element name=\"e\">");
+        }
+        schema.append("<xs:complexType/>");
+        for (int i = 0; i < depth; i++) {
+            schema.append("</xs:element></xs:sequence></xs:complexType>");
+        }
+        schema.append("</xs:element></xs:schema>");
+        return schema.toString();
+    }
+
+    private File newTempDir() {
+        File dir = new File(System.getProperty("java.io.tmpdir"),
+                            "xmlschema-nesting-" + System.nanoTime());
+        assertTrue(dir.mkdir());
+        return dir;
+    }
+
+    /**
+     * Writes an include chain of the given length; every document is
+     * structurally trivial, and the last one carries the given nested
+     * payload (or none).
+     */
+    private File createIncludeChain(File dir, int hops, int leafNestingDepth) throws Exception {
+        for (int i = 0; i < hops; i++) {
+            File f = new File(dir, "hop" + i + ".xsd");
+            Writer out = new FileWriter(f);
+            try {
+                out.write("<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\""
+                          + " targetNamespace=\"urn:nesting\">");
+                if (i + 1 < hops) {
+                    out.write("<xs:include schemaLocation=\"hop" + (i + 1) + ".xsd\"/>");
+                } else if (leafNestingDepth > 0) {
+                    String leaf = buildNestedSchema(leafNestingDepth);
+                    int start = leaf.indexOf("<xs:element");
+                    out.write(leaf.substring(start, leaf.lastIndexOf("</xs:schema>")));
+                }
+                out.write("</xs:schema>");
+            } finally {
+                out.close();
+            }
+        }
+        return new File(dir, "hop0.xsd");
+    }
+}
